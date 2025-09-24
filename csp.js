@@ -5,42 +5,28 @@ var CSP = {},
     stepCounter = 0;
 
 CSP.solve = function solve(csp) {
-  // Solves a constraint satisfaction problem.
-  // `csp` is an object that should have the properties:
-  //    `variables`  : object that holds variable names and their domain.
-  //    `constraints`: list of constraints where each element is an 
-  //                   array of [head node, tail node, constraint function]
-  //    `cb`: callback function for visualizing assignments. It is passed in
-  //          an "assigned" object, an "unassigned" object, and `csp`.
-  //    `timeStep`: milliseconds between invocations of `cb`.
-
   csp.timeStep = csp.timeStep || 1;
+  csp.naryConstraints = csp.naryConstraints || [];
+  // Precompute index from var -> n-ary constraints containing it (for GAC queueing)
+  csp._naryIndex = buildNaryIndex(csp.naryConstraints);
   var result = backtrack({}, csp.variables, csp);
   if (result == FAILURE) { return result; }
-  // Unwrap values from array containers.
-  for (var key in result) {
-    result[key] = result[key][0];
-  }
+  for (var key in result) { result[key] = result[key][0]; }
   return result;
-}
+};
 
 function backtrack(_assigned, unassigned, csp) {
-  // Backtracking search.
-  
-  // Copying assigned in necessary because we modify it. Without copying
-  // the object over, modifying assigned would also change values for old
-  // assigned objects (which are used in callbacks).
   var assigned = {};
   for (var key in _assigned) { assigned[key] = _assigned[key]; }
 
-  if (finished(unassigned)) { return assigned; } // Base case.
+  if (finished(unassigned)) { return assigned; }
   var nextKey = selectUnassignedVariable(unassigned),
       values = orderValues(nextKey, assigned, unassigned, csp);
   delete unassigned[nextKey];
 
   for (var i = 0; i < values.length; i++) {
     stepCounter++;
-    assigned[nextKey] = [values[i]]; // Assign a value to a variable.
+    assigned[nextKey] = [values[i]];
     var consistent = enforceConsistency(assigned, unassigned, csp);
     var newUnassigned = {}, newAssigned = {};
     for (var key in consistent) {
@@ -49,15 +35,13 @@ function backtrack(_assigned, unassigned, csp) {
     }
     if (csp.cb) {
       setTimeout(
-          // Need a closure to fix values of newAssigned and newUnassigned.
-          // Otherwise, _every_ call of the callback takes the on values of the last iteration.
-          (function (newAssigned, newUnassigned) {
-             return function () { csp.cb(newAssigned, newUnassigned, csp); };
-          })(newAssigned, newUnassigned),
-          stepCounter * csp.timeStep
-        );
+        (function (newAssigned, newUnassigned) {
+          return function () { csp.cb(newAssigned, newUnassigned, csp); };
+        })(newAssigned, newUnassigned),
+        stepCounter * csp.timeStep
+      );
     }
-    if (anyEmpty(consistent)) { continue; } // Empty domains means failure.
+    if (anyEmpty(consistent)) { continue; }
     var result = backtrack(newAssigned, newUnassigned, csp);
     if (result != FAILURE) { return result; }
   }
@@ -66,20 +50,17 @@ function backtrack(_assigned, unassigned, csp) {
 }
 
 function finished(unassigned) {
-  // Checks if there are no more variables to assign.
   return Object.keys(unassigned).length == 0;
 }
 
-function anyEmpty(consistent) {
-  // Checks if any variable's domain is empty.
-  for (var key in consistent) {
-    if (consistent[key].length == 0) { return true; }
+function anyEmpty(vars) {
+  for (var key in vars) {
+    if (vars[key].length == 0) { return true; }
   }
   return false;
 }
 
 function partialAssignment(assigned, unassigned) {
-  // Combine unassigned and assigned for use in enforceConsistency.
   var partial = {};
   for (var key in unassigned) { partial[key] = unassigned[key].slice(); }
   for (var key in assigned) { partial[key] = assigned[key].slice(); }
@@ -87,49 +68,131 @@ function partialAssignment(assigned, unassigned) {
 }
 
 function enforceConsistency(assigned, unassigned, csp) {
-  // Enforces arc consistency by removing inconsistent values from
-  // every constraint's tail node.
-
+  // Binary AC-3
   function removeInconsistentValues(head, tail, constraint, variables) {
-    // Removes inconsistent values from the tail node. A value is
-    // inconsistent when if the `tail` is assigned that value, there are
-    // no values in `head`'s domain that satisfies the constraint.
     var hv = variables[head], tv = variables[tail];
     var validTailValues = tv.filter(function (t) {
-      return hv.some(function (h) {
-        return constraint(h, t);
-      });
+      return hv.some(function (h) { return constraint(h, t); });
     });
     var removed = tv.length != validTailValues.length;
     variables[tail] = validTailValues;
     return removed;
   }
-
   function incomingConstraints(node) {
-    // Returns all the constraints where `node` is the head node.
-    return csp.constraints.filter(function (c) {
-      return c[0] == node;
-    });
+    return csp.constraints.filter(function (c) { return c[0] == node; });
   }
-  
-  var queue = csp.constraints.slice(), 
-      variables = partialAssignment(assigned, unassigned);
-  while (queue.length) { // While there are more constraints to test.
+
+  var variables = partialAssignment(assigned, unassigned);
+
+  // Run binary arc consistency first
+  var queue = csp.constraints.slice();
+  while (queue.length) {
     var c = queue.shift(), head = c[0], tail = c[1], constraint = c[2];
     if (removeInconsistentValues(head, tail, constraint, variables)) {
-      // If values from the tail have been removed, incoming constraints
-      // to the tail must be rechecked.
       queue = queue.concat(incomingConstraints(tail));
     }
   }
+
+  // Then run n-ary GAC
+  if (csp.naryConstraints && csp.naryConstraints.length) {
+    enforceGAC(variables, csp);
+  }
+
   return variables;
 }
 
+// ---------- N-ary constraints (GAC) ----------
+
+function buildNaryIndex(naryConstraints) {
+  var index = {};
+  for (var i = 0; i < naryConstraints.length; i++) {
+    var C = naryConstraints[i];
+    for (var j = 0; j < C.vars.length; j++) {
+      var v = C.vars[j];
+      (index[v] = index[v] || []).push(C);
+    }
+  }
+  return index;
+}
+
+function enforceGAC(variables, csp) {
+  var queue = csp.naryConstraints.slice();
+
+  while (queue.length) {
+    var C = queue.shift();
+    var changedAny = false;
+
+    for (var vi = 0; vi < C.vars.length; vi++) {
+      var varName = C.vars[vi];
+      var dom = variables[varName];
+      // If a variable is currently unrepresented (shouldn't happen), skip
+      if (!dom) continue;
+
+      // Try to prune unsupported values
+      var newDom = [];
+      for (var di = 0; di < dom.length; di++) {
+        var val = dom[di];
+        if (hasSupport(varName, val, C, variables)) {
+          newDom.push(val);
+        }
+      }
+      if (newDom.length !== dom.length) {
+        variables[varName] = newDom;
+        changedAny = true;
+      }
+      if (newDom.length === 0) {
+        // Early exit possible; but keep consistent with AC loop which lets caller detect empties
+      }
+    }
+
+    if (changedAny) {
+      // Re-enqueue all n-ary constraints that mention any variable that changed.
+      // For simplicity, we conservatively re-enqueue all constraints that share any var in C.
+      for (var vi2 = 0; vi2 < C.vars.length; vi2++) {
+        var v2 = C.vars[vi2];
+        var related = csp._naryIndex[v2] || [];
+        for (var r = 0; r < related.length; r++) {
+          var Rc = related[r];
+          // Avoid adding duplicates too often; simple check
+          if (queue.indexOf(Rc) === -1) { queue.push(Rc); }
+        }
+      }
+    }
+  }
+}
+
+function hasSupport(focusVar, focusVal, C, variables) {
+  // Search for any assignment to the other vars in C that makes predicate true
+  var others = [];
+  for (var i = 0; i < C.vars.length; i++) {
+    var v = C.vars[i];
+    if (v !== focusVar) { others.push(v); }
+  }
+  // Sort by domain size (fail first)
+  others.sort(function(a, b) { return variables[a].length - variables[b].length; });
+
+  function dfs(idx, partial) {
+    if (idx === others.length) {
+      var tuple = {};
+      for (var k in partial) { tuple[k] = partial[k]; }
+      tuple[focusVar] = focusVal;
+      return C.predicate(tuple);
+    }
+    var v = others[idx];
+    var dom = variables[v];
+    for (var i = 0; i < dom.length; i++) {
+      partial[v] = dom[i];
+      if (dfs(idx + 1, partial)) { return true; }
+    }
+    return false;
+  }
+
+  return dfs(0, {});
+}
+
+// ---------- Heuristics ----------
+
 function selectUnassignedVariable(unassigned) {
-  // Picks the next variable to assign according to the Minimum
-  // Remaining Values heuristic. Pick the variable with the fewest
-  // values remaining in its domain. This helps identify domain
-  // failures earlier.
   var minKey = null, minLen = Number.POSITIVE_INFINITY;
   for (var key in unassigned) {
     var len = unassigned[key].length;
@@ -139,37 +202,24 @@ function selectUnassignedVariable(unassigned) {
 }
 
 function orderValues(nextKey, assigned, unassigned, csp) {
-  // Orders the values of an unassigned variable according to the
-  // Least Constraining Values heuristic. Perform arc consistency
-  // on each possible value, and order variables according to the
-  // how many values were eliminated from all the domains (fewest
-  // eliminated in the front). This helps makes success more likely
-  // by keeping future options open.
-  
   function countValues(vars) {
     var sum = 0;
     for (var key in vars) { sum += vars[key].length; }
     return sum;
   }
-
   function valuesEliminated(val) {
     assigned[nextKey] = [val];
     var newLength = countValues(enforceConsistency(assigned, unassigned, csp));
     delete assigned[nextKey];
     return newLength;
   }
-
-  // Cache valuesEliminated to be used in sort.
   var cache = {}, values = unassigned[nextKey];
-  values.forEach(function(val) {
-    cache[val] = valuesEliminated(val);
-  });
-  // Descending order based on the number of domain values remaining.
+  values.forEach(function(val) { cache[val] = valuesEliminated(val); });
   values.sort(function (a, b) { return cache[b] - cache[a]; });
   return values;
 }
 
-// Taken from d3 source. Makes `csp` usable in other scripts.
+// UMD export
 if (typeof define === 'function' && define.amd) {
   define(CSP);
 } else if (typeof module === 'object' && module.exports) {
